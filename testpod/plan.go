@@ -1,6 +1,7 @@
 package testpod
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"net/http"
@@ -9,12 +10,11 @@ import (
 )
 
 type Plan struct {
-	Clients         map[*Client]bool
+	l           sync.Mutex
+	Clients     map[*Client]bool
+	Outstanding map[string]map[int]time.Time
+
 	ConnectThrottle int
-
-	Failed int
-
-	l sync.Mutex
 
 	NumChannels int
 	NumClients  int
@@ -23,14 +23,9 @@ type Plan struct {
 
 func NewPlan() *Plan {
 	return &Plan{
-		Clients: make(map[*Client]bool),
+		Clients:     make(map[*Client]bool),
+		Outstanding: make(map[string]map[int]time.Time),
 	}
-}
-
-type ClientStats struct {
-	waitConnect   int
-	waitHandshake int
-	connected     int
 }
 
 func (p *Plan) AddClient(c *Client) {
@@ -39,57 +34,37 @@ func (p *Plan) AddClient(c *Client) {
 	p.Clients[c] = true
 }
 
-func (p *Plan) ClientStats() *ClientStats {
-	p.l.Lock()
-	defer p.l.Unlock()
-	stats := new(ClientStats)
-	for c := range p.Clients {
-		switch c.State {
-		case stateWaitConnect:
-			stats.waitConnect++
-		case stateWaitHandshake:
-			stats.waitHandshake++
-		case stateConnected:
-			stats.connected++
-		}
-	}
-	return stats
-}
-
 func (p *Plan) DeleteClient(c *Client) {
 	p.l.Lock()
 	defer p.l.Unlock()
 
-	p.Failed++
 	delete(p.Clients, c)
 }
 
 func (p *Plan) Go() {
-	for {
-		stats := p.ClientStats()
-		fmt.Println(stats, p.Failed)
-
-		for i := 0; i < p.NumClients-len(p.Clients); i++ {
-			c := NewClient()
-			p.AddClient(c)
-			go func(c *Client, url string) {
-				defer p.DeleteClient(c)
-				err := c.Dial(url)
-				if err != nil {
-					log.Print("Error connecting: ", err)
-					return
-				}
-				err = p.Loop(c)
+	for i := 0; i < p.NumClients; i++ {
+		go func(url string) {
+			for {
+				c := NewClient()
+				err := p.Loop(c, url)
 				log.Print("Error: ", err)
-			}(c, p.URLs[i%len(p.URLs)])
-		}
-
-		time.Sleep(1 * time.Second)
+				time.Sleep(5 * time.Second)
+			}
+		}(p.URLs[i%len(p.URLs)])
 	}
+	for {
+		time.Sleep(5 * time.Second)
+
+	}
+
 }
 
-func (p *Plan) Loop(c *Client) error {
-	err := c.Handshake()
+func (p *Plan) Loop(c *Client, url string) error {
+	err := c.Dial(url)
+	if err != nil {
+		return err
+	}
+	err = c.Handshake()
 	if err != nil {
 		return err
 	}
@@ -107,7 +82,6 @@ func (p *Plan) Loop(c *Client) error {
 			}
 		case "hello":
 			c.UAID = msg.UAID
-			c.State = stateConnected
 			for i := 0; i < p.NumChannels; i++ {
 				err := c.Register()
 				if err != nil {
@@ -116,30 +90,52 @@ func (p *Plan) Loop(c *Client) error {
 			}
 		case "register":
 			c.ChannelIDs = append(c.ChannelIDs, msg.ChannelID)
-			go p.StartSender(msg.PushEndpoint)
+			go p.StartSender(msg.PushEndpoint, msg.ChannelID)
 		case "notification":
 			err := c.Ack(msg.Updates)
 			if err != nil {
 				return err
 			}
+			p.l.Lock()
+			for _, u := range msg.Updates {
+				when := p.Outstanding[u.ChannelID][u.Version]
+				fmt.Println("Took:", time.Since(when))
+				delete(p.Outstanding[u.ChannelID], u.Version)
+			}
+			p.l.Unlock()
 		}
 	}
 	return nil
 }
 
-func (p *Plan) StartSender(url string) {
+func (p *Plan) StartSender(url, channelID string) {
 	c := &http.Client{}
+	p.l.Lock()
+	p.Outstanding[channelID] = make(map[int]time.Time)
+	p.l.Unlock()
+
+	version := 1
 	for {
-		req, err := http.NewRequest("PUT", url, nil)
+		body := bytes.NewBufferString(fmt.Sprintf("version=%d", version))
+		req, err := http.NewRequest("PUT", url, body)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		if err != nil {
 			fmt.Print("StartSender:", err)
 			return
 		}
+
+		p.l.Lock()
+		p.Outstanding[channelID][version] = time.Now()
+		p.l.Unlock()
+
 		resp, err := c.Do(req)
 		if err != nil {
 			fmt.Print("StartSender:", err)
 			return
 		}
 		resp.Body.Close()
+
+		version++
+		time.Sleep(5 * time.Second)
 	}
 }

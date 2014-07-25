@@ -14,8 +14,7 @@ const (
 )
 
 type Client struct {
-	State int
-	WS    *websocket.Conn
+	WS *websocket.Conn
 
 	UAID       string
 	ChannelIDs []string
@@ -41,7 +40,6 @@ func (c *Client) Dial(url string) error {
 	}
 
 	c.WS = ws
-	c.State = stateWaitHandshake
 	c.ChannelIDs = []string{}
 
 	return nil
